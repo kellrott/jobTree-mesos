@@ -1,0 +1,15 @@
+
+Mesos jobTree: a reimplemenation for jobTree for Mesos
+
+Original jobTree project: https://github.com/benedictpaten/jobTree/
+
+Add mesos to mesos egg:
+
+PYTHONPATH=/path/to/mesos-0.13.0/src/python/dist/mesos-0.13.0-py2.7-linux-x86_64.egg
+
+The command line arguments:
+Define the directory to store the jobTree data default .jobTree
+--jobTree .jobTree
+Define the URL of the mesos server
+ --batchSystem localhost:5050  
+
