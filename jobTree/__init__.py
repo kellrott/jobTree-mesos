@@ -3,13 +3,15 @@ import sys
 import os
 import re
 import pickle
+from copy import copy
 
 from glob import glob
 import mesos
 import mesos_pb2
 
-def log(m):
-    sys.stderr.write(m + "\n")
+import logging
+logging.basicConfig(filename='jobTree.log',level=logging.DEBUG)
+
 
 class Target(object):
     """
@@ -93,9 +95,11 @@ class JobTreeManager:
         self.common_dir = common_dir
         self.queue = JobTreeQueue(os.path.abspath(common_dir))
     
+    """
     def addTargetList(self, targetList):
         for name, obj in targetList:
             print name, obj
+    """
 
     def run(self):
         self.queue.branchUpdate("/")
@@ -112,18 +116,18 @@ class JobTreeManager:
         # TODO(vinod): Make checkpointing the default when it is default
         # on the slave.
         if os.getenv("MESOS_CHECKPOINT"):
-            print "Enabling checkpoint for the framework"
+            logging.info("Enabling checkpoint for the framework")
             framework.checkpoint = True
 
         if os.getenv("MESOS_AUTHENTICATE"):
-            print "Enabling authentication for the framework"
+            logging.info("Enabling authentication for the framework")
 
             if not os.getenv("DEFAULT_PRINCIPAL"):
-                print "Expecting authentication principal in the environment"
+                logging.error("Expecting authentication principal in the environment")
                 return 
 
             if not os.getenv("DEFAULT_SECRET"):
-                print "Expecting authentication secret in the environment"
+                logging.error("Expecting authentication secret in the environment")
                 return
 
             credential = mesos_pb2.Credential()
@@ -136,14 +140,14 @@ class JobTreeManager:
             self.mesos_url,
             credential)
         else:
-            print "Contacting Mesos: ", self.mesos_url
+            logging.info("Contacting Mesos: %s" % self.mesos_url)
             driver = mesos.MesosSchedulerDriver(
                 JobTreeScheduler(executor, self.queue),
                 framework,
                 self.mesos_url)
                 
         status = 0 if driver.run() == mesos_pb2.DRIVER_STOPPED else 1
-        print "Status:", status
+        logging.info( "Status: %s" % status )
         # Ensure that the driver process terminates.
         driver.stop();
 
@@ -168,14 +172,14 @@ class JobTreeQueue(object):
             os.mkdir(self.basedir)
 
     def branchUpdate(self, taskpath):
-        print "UPDATE:", taskpath
+        logging.debug("UPDATE: %s" % taskpath)
         task_file_path = self.taskFilePath(taskpath)
         task_split = self.taskPathSplit(taskpath)
 
         if os.path.isdir(task_file_path):
-            print "SCANNING", task_file_path
+            logging.debug("SCANNING %s" % task_file_path)
             for target_file in glob(os.path.join(task_file_path, "*%s" % (self.TARGET_SUFFIX))):
-                print "TARGET_FOUND:", target_file
+                logging.debug("TARGET_FOUND: %s" % target_file)
                 target_file_base = re.sub(self.TARGET_SUFFIX + "$", "", target_file)
                 task_name = os.path.basename(target_file_base)
                 if not os.path.exists( target_file_base + self.DONE_SUFFIX ):
@@ -214,7 +218,7 @@ class JobTreeQueue(object):
         self._taskTreeAdd(self.taskPathSplit(taskpath))
 
     def setTaskRunning(self, taskpath):
-        log("TASK_RUNNING: %s" % (taskpath))
+        logging.info("TASK_RUNNING: %s" % (taskpath))
         p = self.taskPathSplit(taskpath)
         branch = self.task_tree
         for v in p[:-1]:
@@ -222,7 +226,7 @@ class JobTreeQueue(object):
         branch[p[-1]] = self.TASK_RUNNING
 
     def setTaskFinished(self, taskpath):
-        log("TASK_FINISHED: %s" % (taskpath))
+        logging.info("TASK_FINISHED: %s" % (taskpath))
         targetPath = self.taskFilePath(taskpath) + self.DONE_SUFFIX
         handle = open(targetPath, "w")
         handle.close()
@@ -233,10 +237,10 @@ class JobTreeQueue(object):
             branch = branch[v]
         branch[p[-1]] = self.TASK_FINISHED
         self._taskTreeSweep()
-        print "FINISHED:", self.task_tree
+        logging.info( "FINISHED: %s" % self.task_tree )
 
     def setTaskFailed(self, taskpath):
-        log("TASK_FAILED: %s" % (taskpath))
+        loggin.info("TASK_FAILED: %s" % (taskpath))
         p = self.taskPathSplit(taskpath)
         branch = self.task_tree
         for v in p[:-1]:
@@ -323,29 +327,32 @@ class JobTreeScheduler(mesos.Scheduler):
         self.messagesReceived = 0
 
     def registered(self, driver, frameworkId, masterInfo):
-        print "Registered with framework ID %s" % frameworkId.value
+        logging.info("Registered with framework ID %s" % frameworkId.value)
 
     def resourceOffers(self, driver, offers):
-        print "Got %d resource offers" % len(offers)
+        logging.info("Got %d resource offers" % len(offers))
         if not self.queue.hasQueued():
             driver.stop()
             return
         for offer in offers:
-            print "Got resource offer %s" % offer.id.value
+            logging.info("Got resource offer %s" % offer.id.value)
 
             cpu_count = 1
             for res in offer.resources:
                 if res.name == 'cpus':
                     cpu_count = int(res.scalar.value)
 
-            print "CPU_COUNT", cpu_count
+            logging.info("CPU_COUNT: %s" % cpu_count)
             tasks = []
+            taskPaths = []
+            tmp_active = copy(self.active_set)
             for i in range(cpu_count):
-                taskPath = self.queue.getTask(self.active_set)
+                taskPath = self.queue.getTask(tmp_active)
                 if taskPath is not None:
-                    self.active_set[taskPath] = True
+                    tmp_active[taskPath] = True
+                    taskPaths.append(taskPath)
 
-                    print "Accepting offer on %s to start task %s" % (offer.hostname, taskPath)
+                    logging.info("Accepting offer on %s to start task %s" % (offer.hostname, taskPath))
 
                     task = mesos_pb2.TaskInfo()
                     task.task_id.value = taskPath
@@ -366,14 +373,23 @@ class JobTreeScheduler(mesos.Scheduler):
                     self.taskData[task.task_id.value] = (offer.slave_id, task.executor.executor_id)
                     tasks.append(task)
                 else:
+                    logging.info("Declining Offer")
                     break                  
-            driver.launchTasks(offer.id, tasks)
+            status = driver.launchTasks(offer.id, tasks)
+            if status == mesos_pb2.DRIVER_RUNNING:
+                for taskPath in taskPaths:
+                    self.active_set[taskPath] = True
+            else:
+                logging.error("Launch Task Fail: %s" % (status))
+
+            logging.info("LaunchStatus: %s : %s " % (status, " ".join(taskPaths)))
 
     def statusUpdate(self, driver, update):
-        print "Task %s is in state %d" % (update.task_id.value, update.state)
+        logging.info("Task %s is in state %d" % (update.task_id.value, update.state))
         if update.state == mesos_pb2.TASK_RUNNING:
             self.queue.setTaskRunning( str(update.data) )
         if update.state == mesos_pb2.TASK_FINISHED:
+            del self.active_set[str(update.data)]
             self.queue.branchUpdate(str(update.data + self.queue.CHILDREN_SUFFIX))
             self.queue.branchUpdate(str(update.data + self.queue.FOLLOW_SUFFIX))
             self.queue.setTaskFinished( str(update.data) )
